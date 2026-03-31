@@ -1,6 +1,8 @@
 # KOOK Bot
 基于 KOOK 平台和 Python 开发的 CS2 数据与娱乐机器人。
 
+### 该项目部分代码、注释和Readme使用AI生成 有问题请提交issue
+
 ## 功能特性
 - 实时饰品价格查询 (Skinport API)
 - 全真 CS2 模拟开箱与全局经济账本
@@ -31,5 +33,3 @@ STEAM_API_KEY=你的steam_api_key写这里
 HF_TOKEN=你的hf_token写这里
 HF_REPO_ID=your_name/Bot_Data
 ALLOWED_CHANNEL_ID=你的频道ID
-
-该项目注释和Readme是使用AI生成的 如果有问题的话可以提交issue
