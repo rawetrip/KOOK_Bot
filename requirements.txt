@@ -1,0 +1,6 @@
+khl.py
+aiohttp
+huggingface_hub
+curl_cffi==0.5.10
+beautifulsoup4==4.12.3
+python-dotenv
