@@ -78,11 +78,11 @@ async def afdian_webhook(request):
 
             # 7. 全自动发货：改写 MongoDB 门禁时间
             await AUTH_COLLECTION.update_one(
-                {"_id": remark},
-                {"$set": {"expire_at": new_expire_at, "authorized_by": f"Afdian自动入账_{out_trade_no[-4:]}"}},
+                {"_id": guild_id}, # 👈 存入服务器 ID
+                {"$set": {"expire_at": expire_at, "authorized_by": msg.author.username}},
                 upsert=True
             )
-            logger.info(f"💰 [SaaS爆金币] 成功收款 ¥{total_amount}！频道 {remark} 已自动开通/续费 {days} 天权限。")
+            await msg.reply(f"✅ 授权成功！\n服务器 ID：`{guild_id}`\n有效期至：{expire_at.strftime('%Y-%m-%d')}")
             
         return web.json_response({"ec": 200, "em": "success"})
     except Exception as e:
@@ -353,12 +353,14 @@ async def show_help(msg: Message):
     await msg.reply(CardMessage(card))
     
 @bot.command(name='auth', prefixes=['/'])
-async def authorize_channel(msg: Message, channel_id: str = "", days: str = "30"):
+async def authorize_guild(msg: Message, guild_id: str = "", days: str = "30"):
+    """手动授权指令：改为授权整个服务器"""
     if msg.author.id != OWNER_ID:
         return await msg.reply("❌ 权限不足：仅限机器人开发者操作。")
     
-    if not channel_id or not days.isdigit():
-        return await msg.reply("用法：/auth [频道ID] [天数(必须为整数)]")
+    # 修复：确保变量名统一为 guild_id
+    if not guild_id or not days.isdigit():
+        return await msg.reply("用法：/auth [服务器ID] [天数]")
 
     expire_at = datetime.datetime.now() + datetime.timedelta(days=int(days))
     
@@ -366,24 +368,28 @@ async def authorize_channel(msg: Message, channel_id: str = "", days: str = "30"
         return await msg.reply("❌ 数据库未连接，无法执行授权。")
         
     await AUTH_COLLECTION.update_one(
-        {"_id": channel_id},
+        {"_id": guild_id},  # 👈 数据库存入服务器 ID
         {"$set": {"expire_at": expire_at, "authorized_by": msg.author.username}},
         upsert=True
     )
     
-    await msg.reply(f"✅ 授权成功！\n频道：`{channel_id}`\n有效期至：{expire_at.strftime('%Y-%m-%d')}")
-    
+    await msg.reply(f"✅ 授权成功！\n服务器 ID：`{guild_id}`\n有效期至：{expire_at.strftime('%Y-%m-%d')}")
+
 @bot.command(name='open', prefixes=['/'])
 async def simulate_case_opening(msg: Message, *args):
-    auth_info = await AUTH_COLLECTION.find_one({"_id": msg.target_id})
+    """CS2 开箱：改为校验服务器 ID"""
+    # 核心：使用 msg.guild_id 进行门禁检查
+    auth_info = await AUTH_COLLECTION.find_one({"_id": msg.guild_id})
+    
     if not auth_info:
-        return await msg.reply("⚠️ 本频道未获得开箱授权。请联系服主申请开通。")
+        return await msg.reply("⚠️ 本服务器未获得高级授权。请联系服主前往爱发电赞助，备注填入【服务器ID】即可自动解锁。")
+    
     if auth_info['expire_at'] < datetime.datetime.now():
-        return await msg.reply("⏰ 授权已过期。请续费后继续使用。")
+        return await msg.reply("⏰ 本服务器授权已过期。请续费后继续使用。")
         
     if not IS_PRICE_READY or not CRATES_CASES:
         return await msg.reply("系统正在同步数据，请稍后...")
-
+    
     count = 1
     if args and args[0].isdigit():
         count = max(1, min(10, int(args[0])))
@@ -1053,7 +1059,7 @@ async def query_hltv_matches(msg: Message):
 @bot.command(name='apex', prefixes=['/'])
 async def simulate_apex_packs(msg: Message, count_str: str = "100"):
     if AUTH_COLLECTION is not None:
-        auth_info = await AUTH_COLLECTION.find_one({"_id": msg.target_id})
+        auth_info = await AUTH_COLLECTION.find_one({"_id": msg.guild_id})
         if not auth_info:
             return await msg.reply("⚠️ 本频道未获得开箱授权。请联系服主申请开通。")
         if auth_info['expire_at'] < datetime.datetime.now():
