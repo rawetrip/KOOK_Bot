@@ -227,12 +227,25 @@ async def init_translation_dictionary():
     with open(dict_file, 'w', encoding='utf-8') as f: json.dump({"DISPLAY_TRANS": DISPLAY_TRANS}, f, ensure_ascii=False)
     if api: await asyncio.to_thread(api.upload_file, path_or_fileobj=dict_file, path_in_repo=dict_file, repo_id=REPO_ID, repo_type="dataset", token=HF_TOKEN)
 
+# 💡 1. 将辅助函数放在全局（所有函数的外面）
+def _load_json_sync(filepath):
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def _save_json_sync(data, filepath):
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+# 💡 2. 更新器主函数
 async def price_auto_updater():
     global IS_PRICE_READY, PRICE_DICT, PRICE_CN_MAP, PRICE_EN_MAP
     cache_file = 'price_cache_v4.json'
+    
     if os.path.exists(cache_file):
         try:
-            with open(cache_file, 'r', encoding='utf-8') as f: PRICE_DICT = json.load(f)
+            # ⬇️ 修复：读取缓存时也使用异步线程池，防止启动时卡顿
+            PRICE_DICT = await asyncio.to_thread(_load_json_sync, cache_file)
             if PRICE_DICT:
                 PRICE_CN_MAP = {i['cn_name']: i for i in PRICE_DICT}; PRICE_EN_MAP = {i['en_name']: i for i in PRICE_DICT}
                 IS_PRICE_READY = True
@@ -259,12 +272,17 @@ async def price_auto_updater():
                         PRICE_DICT = new_prices
                         PRICE_CN_MAP = {i['cn_name']: i for i in PRICE_DICT}; PRICE_EN_MAP = {i['en_name']: i for i in PRICE_DICT}
                         IS_PRICE_READY = True
-                        with open(cache_file, 'w', encoding='utf-8') as f: json.dump(PRICE_DICT, f, ensure_ascii=False)
+                        
+                        # ⬇️ 修复：写入缓存时使用异步线程池（你这里写得很对！）
+                        await asyncio.to_thread(_save_json_sync, PRICE_DICT, cache_file)
+                        
                         logger.info(f"[Price] 价格库同步成功，共 {len(PRICE_DICT)} 条。")
                         _sync_search_skin_cached.cache_clear()
                         await asyncio.sleep(86400)
                         continue
-        except Exception as e: logger.error(f"[Price] 更新异常: {e}")
+        except Exception as e: 
+            logger.error(f"[Price] 更新异常: {e}")
+            
         await asyncio.sleep(300)
 
 async def get_all_data(steam_id: str):
@@ -417,13 +435,19 @@ async def simulate_case_opening(msg: Message, *args):
                 elif tiers['gold']: won_item_raw = random.choice(tiers['gold'])
                 else:
                     if not is_capsule:
-                        won_item_dict = random.choice([i for i in PRICE_DICT if any(k in i['cn_name'] for k in ["刀", "手套", "★"])])
+                        # 修复：防止 PRICE_DICT 中没有刀具时触发 IndexError
+                        knives = [i for i in PRICE_DICT if any(k in i['cn_name'] for k in ["刀", "手套", "★"])]
+                        if knives:
+                            won_item_dict = random.choice(knives)
+                            won_item_name = won_item_dict['cn_name']
+                            won_item_price = won_item_dict['price']
+                        else:
+                            won_item_name = "未知罕见物品"
+                            won_item_price = 2000.0
                         won_item_raw = "GOLDBACK"
-                        won_item_name = won_item_dict['cn_name']
-                        won_item_price = won_item_dict['price']
                     else:
-                        selected_tier = 'red' 
-
+                        selected_tier = 'red'
+                        
             if not won_item_raw:
                 fallback_order = ['red', 'pink', 'purple', 'blue', 'gold']
                 start_idx = fallback_order.index(selected_tier)
@@ -655,7 +679,10 @@ async def query_full_profile(msg: Message, steam_id: str = ""):
     loading_msg = await msg.reply(f"正在连接 Steam 官方数据节点，同步玩家 {steam_id} 的档案...")
     try:
         d = await get_all_data(steam_id)
-        summary = d['summary'].get('response', {}).get('players', [None])[0]
+        # 修复 1：防止 players 列表为空时触发 IndexError
+        players = d['summary'].get('response', {}).get('players', [])
+        summary = players[0] if players else None
+    
         if not summary:
             await safe_delete_msg(bot, loading_msg)
             return await msg.reply("[Error] 查无此人。可能原因：数据私密或参数无效。")
@@ -691,17 +718,18 @@ async def query_full_profile(msg: Message, steam_id: str = ""):
             map_line = f"{MAP_MAP.get(top_m[0][0], top_m[0][0])} (胜场: {top_m[0][1]})" if top_m else "无胜场记录"
 
             dmg = s.get('total_damage_done', 0)
-            rounds = s.get('total_rounds_played', 1)
+            rounds = s.get('total_rounds_played', 0) # 修复 2：默认值改为 0
             won_matches = s.get('total_matches_won', 0)
             play_matches = s.get('total_matches_played', 0)
-            
+    
             adr_val = dmg / rounds if rounds > 0 else 0
-            
+    
             if play_matches > 0 and won_matches > 0:
                 win_rate_str = f"{(won_matches / play_matches) * 100:.1f}%"
             else:
                 won_rounds = s.get('total_wins', 0)
-                win_rate_str = f"{(won_rounds / rounds) * 100:.1f}%"
+                # 修复 3：防止除以零
+                win_rate_str = f"{(won_rounds / rounds) * 100:.1f}%" if rounds > 0 else "0.0%"
 
             if rounds > 0:
                 kpr = min(k / rounds, 1.5)           
@@ -833,25 +861,32 @@ async def check_cs2_status(msg: Message):
         url_official = f"https://api.steampowered.com/ICSGOServers_730/GetGameServersStatus/v1/?key={STEAM_API_KEY}"
         url_web_test = "https://steamcommunity.com/market/search/render/?appid=730&count=1"
         
-        task_off = AIO_SESSION.get(url_official, timeout=12)
-        task_web = AIO_SESSION.get(url_web_test, timeout=12)
-        off_resp, web_resp = await asyncio.gather(task_off, task_web, return_exceptions=True)
+        # 修复：封装异步请求，确保使用 async with 正确释放连接
+        async def fetch_off():
+            async with AIO_SESSION.get(url_official, timeout=12) as resp:
+                return resp.status, await resp.json() if resp.status == 200 else {}
+                
+        async def fetch_web():
+            async with AIO_SESSION.get(url_web_test, timeout=12) as resp:
+                return resp.status
+
+        off_res, web_status = await asyncio.gather(fetch_off(), fetch_web(), return_exceptions=True)
 
         services, mm = {}, {}
-        if isinstance(off_resp, aiohttp.ClientResponse) and off_resp.status == 200:
-            data = await off_resp.json()
+        if isinstance(off_res, tuple) and off_res[0] == 200:
+            data = off_res[1]
             res = data.get('result', {})
             services = res.get('services', {})
             mm = res.get('matchmaking', {})
 
         real_inv_status = "Offline"
-        if isinstance(web_resp, aiohttp.ClientResponse):
-            if web_resp.status == 200:
+        if isinstance(web_status, int):
+            if web_status == 200:
                 real_inv_status = "Online"
-            elif web_resp.status == 429:
+            elif web_status == 429:
                 real_inv_status = "Surge"
             else:
-                real_inv_status = f"[ERROR] HTTP {web_resp.status}"
+                real_inv_status = f"[ERROR] HTTP {web_status}"
 
         status_map = {
             "normal": "Online",
