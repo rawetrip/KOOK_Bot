@@ -54,7 +54,16 @@ async def afdian_webhook(request):
             return web.json_response({"ec": 200, "em": "ok"}) # 必须回 200，不然爱发电会一直重发
             
         # 4. 汇率换算：假设 30 元 = 30 天包月权限 (你可以根据自己的定价随便改)
-        days = 30 if total_amount >= 30.0 else 0
+        # 假设你想设置 1元 = 1天 的汇率（30元就是30天，300元就是300天）
+        days = int(total_amount) 
+
+        # 4. 汇率换算：精准匹配咱们设置的三档爱发电赞助方案
+        if total_amount >= 250.0:
+            days = 365  # 💎 违禁级：包年特权
+        elif total_amount >= 30.0:
+            days = 30   # 🥇 隐秘级：包月特权
+        else:
+            days = 0    # 🥉 军规级 (<30元)：纯打赏不发货
         
         if days > 0 and AUTH_COLLECTION is not None:
             # 5. 获取该频道当前的授权信息
@@ -285,8 +294,46 @@ async def get_all_data(steam_id: str):
     return dict(results)
 
 # ==========================================
-# 4. 指令逻辑 (重点修改 Economy 结算)
+# 4. 指令逻辑
 # ==========================================
+@bot.command(name='help', prefixes=['/'])
+async def show_help(msg: Message):
+    """机器人的使用说明书与指令菜单"""
+    help_text = """**🤖 游戏助手 | 指令菜单**
+---
+**🔫 CS2 核心功能**
+> `/cs [SteamID64]` 
+> 📊 查询官匹数据及实战评级（*注：需将 Steam 资料与库存设为公开*）
+
+> `/skin [物品] [皮肤] [磨损]` 
+> 💰 检索全网底价（*示例：`/skin AWP 可燃冰 崭新`*）
+> 
+> `/status` 
+> 📡 查询官方服务器及匹配节点状态
+
+> `/hltv` 
+> 🏆 获取当前赛事比分及最新战况
+
+**📦 娱乐经济系统**
+> `/open [数量(1-10)]` 
+> 🎰 模拟开箱并记录你的历史盈亏！（*示例：`/open 10` 进行十连抽*）
+
+**🛸 APEX 英雄系统**
+> `/apexstat [EA_ID] [平台]` 
+> 🏅 查询排位分数及在线状态（*平台选填：PC / PS4 / X1*）
+
+> `/apexmap` 
+> 🗺️ 获取实时匹配与排位地图轮换
+
+> `/apex [数量(50-500)]` 
+> 🔴 模拟 APEX 开包，测测你的传家宝运气！（*示例：`/apex 50` 进行50连抽*）
+---
+💡 *如需开通本频道的高级娱乐授权，请访问服主爱发电主页赞助解锁。*"""
+
+    card = Card(color="#4A90E2")
+    card.append(Module.Section(Element.Text(help_text, type=Types.Text.KMD)))
+    await msg.reply(CardMessage(card))
+    
 @bot.command(name='auth', prefixes=['/'])
 async def authorize_channel(msg: Message, channel_id: str = "", days: str = "30"):
     if msg.author.id != OWNER_ID:
