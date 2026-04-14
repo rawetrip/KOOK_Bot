@@ -18,43 +18,88 @@ from functools import lru_cache
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # ==========================================
-# 1. 基础配置与全局变量初始化
+# 1. 基础配置与数据库初始化
 # ==========================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 安全地从环境变量加载所有敏感凭证 (防止泄露到 GitHub)
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '你的TOKEN')
-STEAM_API_KEY = os.environ.get('STEAM_API_KEY', '你的KEY')
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+STEAM_API_KEY = os.environ.get('STEAM_API_KEY')
 MONGO_URI = os.environ.get('MONGO_URI')
 HF_TOKEN = os.environ.get('HF_TOKEN')
 REPO_ID = os.environ.get('HF_REPO_ID')
-OWNER_ID = os.environ.get('OWNER_ID', '你的KOOK_ID')
-APEX_API_KEY = os.environ.get('APEX_API_KEY', '你的APEX_KEY')
+OWNER_ID = os.environ.get('OWNER_ID')
+APEX_API_KEY = os.environ.get('APEX_API_KEY')
+AFDIAN_SECRET = os.environ.get('AFDIAN_SECRET')
 
-# MongoDB 全局实例
+async def afdian_webhook(request):
+    """接收爱发电的付款通知，全自动给群主发货（支持时长无缝叠加）"""
+    # 1. 简易安全校验：防止黑客恶意伪造付款通知
+    secret = request.query.get('secret')
+    if secret != AFDIAN_SECRET:
+        return web.Response(status=403, text="Forbidden: 秘钥错误")
+        
+    try:
+        data = await request.json()
+        order_data = data.get('data', {}).get('order', {})
+        
+        # 2. 提取订单关键信息
+        remark = str(order_data.get('remark', '')).strip() # 玩家在备注里填的 KOOK 频道 ID
+        total_amount = float(order_data.get('total_amount', 0.0))
+        out_trade_no = order_data.get('out_trade_no', 'unknown')
+        
+        # 3. 过滤掉瞎填备注的订单（KOOK 频道 ID 是纯数字，通常很长）
+        if not remark.isdigit() or len(remark) < 10:
+            logger.warning(f"[SaaS] 收到付款 {total_amount} 元，但买家备注的频道ID格式不对: '{remark}'，需人工核对。")
+            return web.json_response({"ec": 200, "em": "ok"}) # 必须回 200，不然爱发电会一直重发
+            
+        # 4. 汇率换算：假设 30 元 = 30 天包月权限 (你可以根据自己的定价随便改)
+        days = 30 if total_amount >= 30.0 else 0
+        
+        if days > 0 and AUTH_COLLECTION is not None:
+            # 5. 获取该频道当前的授权信息
+            current_auth = await AUTH_COLLECTION.find_one({"_id": remark})
+            now = datetime.datetime.now()
+            
+            # 6. 计算新的到期时间（核心优化：未过期则叠加，已过期则重置）
+            if current_auth and current_auth.get('expire_at') and current_auth['expire_at'] > now:
+                new_expire_at = current_auth['expire_at'] + datetime.timedelta(days=days)
+            else:
+                new_expire_at = now + datetime.timedelta(days=days)
+
+            # 7. 全自动发货：改写 MongoDB 门禁时间
+            await AUTH_COLLECTION.update_one(
+                {"_id": remark},
+                {"$set": {"expire_at": new_expire_at, "authorized_by": f"Afdian自动入账_{out_trade_no[-4:]}"}},
+                upsert=True
+            )
+            logger.info(f"💰 [SaaS爆金币] 成功收款 ¥{total_amount}！频道 {remark} 已自动开通/续费 {days} 天权限。")
+            
+        return web.json_response({"ec": 200, "em": "success"})
+    except Exception as e:
+        logger.error(f"[Webhook] 处理订单时发生异常: {e}")
+        return web.Response(status=500, text="Internal Server Error")
+
 DB_CLIENT = None
-ECO_COLLECTION = None   # 玩家经济账户集合
-AUTH_COLLECTION = None  # 频道授权名单集合
+ECO_COLLECTION = None
+AUTH_COLLECTION = None
 
 async def init_db():
-    """初始化 MongoDB 云端金库连接"""
     global DB_CLIENT, ECO_COLLECTION, AUTH_COLLECTION
     if MONGO_URI:
         try:
-            # 建立异步连接，设置 5 秒超时
-            DB_CLIENT = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+            DB_CLIENT = AsyncIOMotorClient(
+                MONGO_URI, 
+                serverSelectionTimeoutMS=5000
+            )
             db = DB_CLIENT['cs2_bot_db']
             ECO_COLLECTION = db['economy']
             AUTH_COLLECTION = db['authorized_channels']
-            
-            # 发送 ping 命令测试握手状态
             await DB_CLIENT.admin.command('ping')
             logger.info("[System] MongoDB 云端金库连接成功！")
         except Exception as e:
             logger.error(f"[System] 数据库连接失败: {e}")
     
-# 本地数据缓存 (由后台异步任务定期刷新)
 PRICE_DICT = []
 PRICE_CN_MAP = {}
 PRICE_EN_MAP = {}
@@ -67,7 +112,6 @@ AIO_SESSION: aiohttp.ClientSession = None
 api = HfApi() if HF_TOKEN and REPO_ID else None
 bot = Bot(token=BOT_TOKEN)
 
-# 静态常量映射表
 WEAPON_MAP = {
     "ak47": "AK47", "awp": "AWP", "m4a1": "M4A4", "m4a1_silencer": "M4A1-S",      
     "deagle": "沙鹰", "glock": "格洛克", "usp_silencer": "USP", "ssg08": "鸟狙", 
@@ -93,7 +137,6 @@ STD_HEADERS = {
 # ==========================================
 @lru_cache(maxsize=128)
 def _sync_search_skin_cached(search_tuple):
-    """利用 lru_cache 提升饰品搜索速度，减少内存遍历开销"""
     return sorted(
         [i for i in PRICE_DICT if all(t in i["search_text"] for t in search_tuple)], 
         key=lambda x: x["price"], 
@@ -101,7 +144,6 @@ def _sync_search_skin_cached(search_tuple):
     )
 
 async def safe_delete_msg(bot_instance, msg_obj):
-    """安全撤回消息，通常用于清理 '正在加载...' 的过渡提示"""
     if not msg_obj: return
     try:
         msg_id = getattr(msg_obj, 'id', getattr(msg_obj, 'msg_id', None))
@@ -113,28 +155,29 @@ async def safe_delete_msg(bot_instance, msg_obj):
         logger.debug(f"[Clean] 消息删除失败: {e}")
 
 # ==========================================
-# 3. 异步后台数据守护进程 (Daemon)
+# 3. 异步数据同步模块
 # ==========================================
 async def async_fetch_json(url, headers=None):
-    """通用异步 JSON 拉取器"""
-    if not AIO_SESSION: return []
+    if not AIO_SESSION:
+        return []
+        
     try:
         async with AIO_SESSION.get(url, headers=headers or STD_HEADERS, timeout=60) as resp:
             if resp.status == 200:
-                try: return await resp.json()
-                except Exception as e: logger.error(f"[JSON解析错误] {url}: {e}")
+                try:
+                    return await resp.json()
+                except Exception as e:
+                    logger.error(f"[JSON解析错误] {url}: {e}")
     except Exception as e:
         logger.debug(f"[网络请求错误] {url}: {e}")
     return []
 
 def update_affordable_crates():
-    """过滤掉天价武器箱，避免影响日常模拟抽奖体验"""
     global AFFORDABLE_CASES, AFFORDABLE_CAPSULES
     AFFORDABLE_CASES = [c for c in CRATES_CASES if PRICE_CN_MAP.get(c.get('name'), {}).get('price', 5.0) <= 800]
     AFFORDABLE_CAPSULES = [c for c in CRATES_CAPSULES if PRICE_CN_MAP.get(c.get('name'), {}).get('price', 1.5) <= 800]
 
 async def init_crates_data():
-    """从开源仓库抓取 CS2 官方掉落概率表"""
     global CRATES_DICT, CRATES_CASES, CRATES_CAPSULES, AFFORDABLE_CASES, AFFORDABLE_CAPSULES
     url = "https://cdn.jsdelivr.net/gh/ByMykel/CSGO-API@main/public/api/zh-CN/crates.json"
     try:
@@ -148,7 +191,6 @@ async def init_crates_data():
         logger.error(f"[Init] 掉落表拉取失败: {e}")
 
 async def init_translation_dictionary():
-    """构建中英文对照词典，优先从 Hugging Face 读取缓存以防 CDN 墙"""
     global DISPLAY_TRANS
     dict_file = 'auto_dict_v4.json'
     if api:
@@ -177,7 +219,6 @@ async def init_translation_dictionary():
     if api: await asyncio.to_thread(api.upload_file, path_or_fileobj=dict_file, path_in_repo=dict_file, repo_id=REPO_ID, repo_type="dataset", token=HF_TOKEN)
 
 async def price_auto_updater():
-    """定时任务：通过 Skinport API 自动同步 20,000+ 件饰品的最新底价"""
     global IS_PRICE_READY, PRICE_DICT, PRICE_CN_MAP, PRICE_EN_MAP
     cache_file = 'price_cache_v4.json'
     if os.path.exists(cache_file):
@@ -190,7 +231,6 @@ async def price_auto_updater():
 
     while True:
         try:
-            # 使用 curl_cffi 伪装指纹，绕过部分基础防护
             async with AsyncSession(impersonate="chrome110", timeout=60) as session:
                 resp = await session.get("https://api.skinport.com/v1/items?app_id=730&currency=CNY")
                 if resp.status_code == 200:
@@ -201,10 +241,8 @@ async def price_auto_updater():
                         price = item.get('min_price') or item.get('suggested_price') or 0
                         if en_name and price:
                             cn_name = en_name
-                            # 应用词典进行粗略汉化
                             for eng, chn in DISPLAY_TRANS.items():
                                 if eng in cn_name: cn_name = cn_name.replace(eng, chn)
-                            # 简化磨损后缀提升卡片显示效果
                             cn_name = cn_name.replace("(崭新出厂)", "(崭新)").replace("(略有磨损)", "(略磨)").replace("(久经沙场)", "(久经)").replace("(破损不堪)", "(破损)").replace("(战痕累累)", "(战痕)")
                             new_prices.append({"en_name": en_name, "cn_name": cn_name, "search_text": f"{en_name} {cn_name}".lower(), "price": float(price)})
                     
@@ -214,14 +252,14 @@ async def price_auto_updater():
                         IS_PRICE_READY = True
                         with open(cache_file, 'w', encoding='utf-8') as f: json.dump(PRICE_DICT, f, ensure_ascii=False)
                         logger.info(f"[Price] 价格库同步成功，共 {len(PRICE_DICT)} 条。")
-                        _sync_search_skin_cached.cache_clear() # 清理检索缓存
-                        await asyncio.sleep(86400) # 每天同步一次
+                        _sync_search_skin_cached.cache_clear()
+                        await asyncio.sleep(86400)
                         continue
         except Exception as e: logger.error(f"[Price] 更新异常: {e}")
-        await asyncio.sleep(300) # 失败重试间隔
+        await asyncio.sleep(300)
 
 async def get_all_data(steam_id: str):
-    """并发请求 Steam 官方多个接口，获取全量玩家数据"""
+    """并发获取玩家的个人信息、等级、封禁状态、CS2数据和库存"""
     if not AIO_SESSION:
         return {"summary": {}, "level": {}, "bans": {}, "stats": {}, "inv": {}}
 
@@ -242,19 +280,15 @@ async def get_all_data(steam_id: str):
             logger.debug(f"[Steam API] 获取 {key} 失败: {e}")
         return key, {}
 
+    # 并发执行所有请求
     results = await asyncio.gather(*(fetch(k, v) for k, v in urls.items()))
     return dict(results)
 
 # ==========================================
-# 4. KOOK 交互指令逻辑模块
+# 4. 指令逻辑 (重点修改 Economy 结算)
 # ==========================================
-
 @bot.command(name='auth', prefixes=['/'])
 async def authorize_channel(msg: Message, channel_id: str = "", days: str = "30"):
-    """
-    [管理员指令] SaaS 核心逻辑：为指定频道签发开箱/抽卡权限。
-    只有配置在环境变量 OWNER_ID 中的开发者才能调用。
-    """
     if msg.author.id != OWNER_ID:
         return await msg.reply("❌ 权限不足：仅限机器人开发者操作。")
     
@@ -266,7 +300,6 @@ async def authorize_channel(msg: Message, channel_id: str = "", days: str = "30"
     if AUTH_COLLECTION is None:
         return await msg.reply("❌ 数据库未连接，无法执行授权。")
         
-    # 原子更新频道授权表 (upsert 意味着如果频道不存在则新建记录)
     await AUTH_COLLECTION.update_one(
         {"_id": channel_id},
         {"$set": {"expire_at": expire_at, "authorized_by": msg.author.username}},
@@ -277,11 +310,6 @@ async def authorize_channel(msg: Message, channel_id: str = "", days: str = "30"
     
 @bot.command(name='open', prefixes=['/'])
 async def simulate_case_opening(msg: Message, *args):
-    """
-    CS2 全真模拟开箱系统。
-    包含 SaaS 门禁校验、官方概率推演以及跨游戏的 MongoDB 经济结算。
-    """
-    # --- 1. 动态权限拦截 ---
     auth_info = await AUTH_COLLECTION.find_one({"_id": msg.target_id})
     if not auth_info:
         return await msg.reply("⚠️ 本频道未获得开箱授权。请联系服主申请开通。")
@@ -293,35 +321,31 @@ async def simulate_case_opening(msg: Message, *args):
 
     count = 1
     if args and args[0].isdigit():
-        count = max(1, min(10, int(args[0]))) # 限制单次最高十连抽防止刷屏
+        count = max(1, min(10, int(args[0])))
 
     try:
         opened_items = []
         total_cost_all, total_earned_all = 0.0, 0.0
-        
-        # CS2 官方掉落概率基准权重
         tiers_list = ['gold', 'red', 'pink', 'purple', 'blue']
         tiers_weights = [1.00, 2.50, 10.00, 30.00, 56.50]
 
-        # --- 2. 抽奖算法运算 ---
         for _ in range(count):
-            is_capsule = random.random() < 0.25 # 25% 概率抽胶囊
+            is_capsule = random.random() < 0.25
             valid_crates = AFFORDABLE_CAPSULES if is_capsule else AFFORDABLE_CASES 
             if not valid_crates: continue
             
             crate = random.choice(valid_crates)
             crate_name = crate.get('name')
 
-            # 动态计算抽奖成本 (箱子市价 + 钥匙价格)
             crate_price_data = PRICE_CN_MAP.get(crate_name)
             crate_market_price = crate_price_data['price'] if crate_price_data else (1.5 if is_capsule else 5.0)
+
             is_key_required = (crate.get('type') in ['Weapon Case', '武器箱'] or '武器箱' in crate_name)
             single_cost = crate_market_price + (17.5 if is_key_required else 0.0)
 
             contains = crate.get('contains', [])
             contains_rare = crate.get('contains_rare', []) 
 
-            # 根据武器稀有度清洗掉落池
             tiers = {'gold': [], 'red': [], 'pink': [], 'purple': [], 'blue': []}
             for item in contains:
                 rarity_name = str(item.get('rarity', {}).get('name', '') if isinstance(item.get('rarity'), dict) else item.get('rarity', ''))
@@ -338,11 +362,9 @@ async def simulate_case_opening(msg: Message, *args):
                 else: 
                     tiers['blue'].append(item)
 
-            # 执行概率判定
             selected_tier = random.choices(tiers_list, weights=tiers_weights, k=1)[0]
             won_item_raw, won_item_name, won_item_price = None, "未知物品", 0.0
 
-            # 特殊处理出金逻辑 (如果数据表里没有金，则强制去全站价格表里随机抓一把刀)
             if selected_tier == 'gold':
                 if contains_rare: won_item_raw = random.choice(contains_rare)
                 elif tiers['gold']: won_item_raw = random.choice(tiers['gold'])
@@ -353,9 +375,8 @@ async def simulate_case_opening(msg: Message, *args):
                         won_item_name = won_item_dict['cn_name']
                         won_item_price = won_item_dict['price']
                     else:
-                        selected_tier = 'red' # 胶囊没金就降级
+                        selected_tier = 'red' 
 
-            # 稀有度兜底，防止因为数据库不完整导致报错
             if not won_item_raw:
                 fallback_order = ['red', 'pink', 'purple', 'blue', 'gold']
                 start_idx = fallback_order.index(selected_tier)
@@ -371,21 +392,21 @@ async def simulate_case_opening(msg: Message, *args):
                 logger.error(f"[Open] 掉落池为空 - 箱子: {crate_name}")
                 return await msg.reply(f"[Error] 模拟中断：{crate_name} 的数据池异常。")
 
-            # 匹配真实饰品并附加随机磨损/玄学
             if won_item_raw != "GOLDBACK":
                 base_name = str(won_item_raw.get('name', ''))
+                
                 matched_items = []
                 if base_name:
                     for i in PRICE_DICT:
                         if base_name in i['cn_name'] or base_name in i['en_name']:
                             cn = i['cn_name']
-                            # 严格过滤印花后缀干扰
                             if "闪亮" in cn and "闪亮" not in base_name: continue
                             if "全息" in cn and "全息" not in base_name: continue
                             if "斑斓" in cn and "斑斓" not in base_name: continue
                             if "暗金" in cn and "暗金" not in base_name and "StatTrak" not in base_name: continue
                             if "纪念品" in cn and "纪念品" not in base_name: continue
                             if ("金" in cn or "Gold" in cn) and ("金" not in base_name and "Gold" not in base_name): continue
+                            
                             matched_items.append(i)
                 
                 if matched_items:
@@ -405,6 +426,7 @@ async def simulate_case_opening(msg: Message, *args):
 
             total_cost_all += single_cost
             total_earned_all += won_item_price
+
             opened_items.append({
                 'crate_name': crate_name, 'item_name': won_item_name, 'price': won_item_price,
                 'cost': single_cost, 'tier': selected_tier, 'rarity_name': rarity_name_display, 'color': color_code
@@ -413,12 +435,10 @@ async def simulate_case_opening(msg: Message, *args):
         if not opened_items:
             return await msg.reply("[Error] 模拟执行失败，底层随机种子生成终止。")
 
-        # --- 3. MongoDB 事务结算 (高并发安全) ---
         profit_all = total_earned_all - total_cost_all
         user_id, user_name = str(msg.author.id), msg.author.username
         
         if ECO_COLLECTION is not None:
-            # 使用 find_one_and_update 实现原子级排队递增，绝不串号
             updated_doc = await ECO_COLLECTION.find_one_and_update(
                 {"_id": user_id}, 
                 {
@@ -439,9 +459,8 @@ async def simulate_case_opening(msg: Message, *args):
             total_profit, total_opens = profit_all, count
             logger.error("[Economy] 数据库未连接，本次数据未保存！")
             
-        # --- 4. 渲染 KMD 豪华卡片 ---
         best_item = max(opened_items, key=lambda x: x['price'])
-        card = Card(color=best_item['color']) # 根据最贵饰品变换卡片边框色
+        card = Card(color=best_item['color']) 
         
         if count == 1:
             item = opened_items[0]
@@ -464,7 +483,6 @@ async def simulate_case_opening(msg: Message, *args):
             ])
             card.append(Module.Section(Element.Text("\n".join(lines), type=Types.Text.KMD)))
 
-        # 根据盈亏动态评价
         context_text = f"[ 用户: {user_name} ] "
         if best_item['tier'] == 'gold' or profit_all > 150: context_text += "你牛大了"
         elif profit_all < -(15 * count): context_text += "亏麻了"
@@ -479,14 +497,9 @@ async def simulate_case_opening(msg: Message, *args):
 
 @bot.command(name='skin', prefixes=['/'])
 async def search_skin(msg: Message, *args):
-    """
-    基于全站价格库缓存的极速查价工具。
-    支持交互式按钮流转查询明细。
-    """
     try:
         if not IS_PRICE_READY: return await msg.reply("数据库正在初始化，请稍后尝试...")
         
-        # 拦截空参数并提供快捷按钮
         if not args:
             card = Card(color="#4A90E2")
             card.append(Module.Header("市场饰品快速检索"))
@@ -510,7 +523,6 @@ async def search_skin(msg: Message, *args):
         card.append(Module.Section(Element.Text("```\n" + "\n".join(lines) + "\n```", type=Types.Text.KMD)))
         card.append(Module.Context(Element.Text("**点击下方对应编号，查阅详细数据：**", type=Types.Text.KMD)))
         
-        # 动态生成外链查询按钮
         for i in range(0, min(8, len(results)), 4):
             group_btns = [Element.Button(f"详细 #{i+idx+1}", value=f"skin_chart|{item['en_name']}", click=Types.Click.RETURN_VAL, theme=Types.Theme.PRIMARY) 
                           for idx, item in enumerate(results[i:i+4])]
@@ -521,7 +533,6 @@ async def search_skin(msg: Message, *args):
         logger.error(f"[Skin] 检索模块异常: {e}", exc_info=True)
         await msg.reply("[Error] 检索模块触发异常。")
 
-# 按钮事件监听路由
 @bot.on_event(EventTypes.MESSAGE_BTN_CLICK)
 async def on_skin_button_click(b: Bot, e: Event):
     val = e.body.get('value', '')
@@ -591,10 +602,6 @@ async def on_skin_button_click(b: Bot, e: Event):
 
 @bot.command(name='cs', prefixes=['/'])
 async def query_full_profile(msg: Message, steam_id: str = ""):
-    """
-    玩家全量档案聚合。
-    提取 Steam 官方底层统计，估算 Rating 2.0 及相关电竞级维度的实力数据。
-    """
     if not steam_id or not steam_id.isdigit():
         return await msg.reply("[Error] 参数校验失败：请输入17位数字型 SteamID。")
 
@@ -622,7 +629,6 @@ async def query_full_profile(msg: Message, steam_id: str = ""):
         weapon_line, map_line, has_stats = "无相关数据", "无相关数据", isinstance(stats_res, dict) and 'playerstats' in stats_res
         recent_stats = None 
         
-        # HLTV Rating 2.0 拟合算法模块
         if has_stats:
             s = {i['name']: i['value'] for i in stats_res.get('playerstats', {}).get('stats', [])}
             k, dt = s.get('total_kills', 0), s.get('total_deaths', 1)
@@ -775,7 +781,6 @@ async def query_full_profile(msg: Message, steam_id: str = ""):
 
 @bot.command(name='status', prefixes=['/'])
 async def check_cs2_status(msg: Message):
-    """查询 CS2 官方服务器群落连通状态"""
     loading_msg = await msg.reply("正在查询服务器状态...")
     try:
         url_official = f"https://api.steampowered.com/ICSGOServers_730/GetGameServersStatus/v1/?key={STEAM_API_KEY}"
@@ -847,11 +852,6 @@ async def check_cs2_status(msg: Message):
 
 @bot.command(name='hltv', prefixes=['/'])
 async def query_hltv_matches(msg: Message):
-    """
-    HLTV 电竞门户爬虫。
-    获取实时的 Major/杯赛 队伍比分并提供数据流直达链接。
-    使用了 curl_cffi 绕过 Cloudflare 盾。
-    """
     loading_msg = await msg.reply("正在连接至 HLTV 服务器...")
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
@@ -870,7 +870,9 @@ async def query_hltv_matches(msg: Message):
             return await msg.reply("[Error] 被 HLTV 的 Cloudflare 盾拦截了，请稍后重试。")
 
         live_matches = []
+        
         live_elements = soup.find_all(class_=lambda c: c and ('matchLive' in c or 'liveMatch-container' in c))
+        
         for time_elem in soup.find_all(class_='matchTime'):
             if 'LIVE' in time_elem.get_text(strip=True).upper():
                 live_elements.append(time_elem)
@@ -910,6 +912,7 @@ async def query_hltv_matches(msg: Message):
 
         recent_matches = []
         if not live_matches:
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
             async with AsyncSession(impersonate="chrome120", timeout=15, headers=headers) as session:
                 resp_results = await session.get("https://www.hltv.org/results")
             if resp_results.status_code == 200:
@@ -967,10 +970,6 @@ async def query_hltv_matches(msg: Message):
 
 @bot.command(name='apex', prefixes=['/'])
 async def simulate_apex_packs(msg: Message, count_str: str = "100"):
-    """
-    跨游戏生态支持：APEX 传家宝模拟抽奖。
-    与 CS2 模块共享同样的 MongoDB 虚拟经济账户，体现 SaaS 产品的一致性。
-    """
     if AUTH_COLLECTION is not None:
         auth_info = await AUTH_COLLECTION.find_one({"_id": msg.target_id})
         if not auth_info:
@@ -990,11 +989,11 @@ async def simulate_apex_packs(msg: Message, count_str: str = "100"):
         
         results = {'heirloom': 0, 'legendary': 0, 'epic': 0, 'rare': 0, 'common': 0}
         total_earned = 0.0
+
         values = {'heirloom': 1500.0, 'legendary': 20.0, 'epic': 5.0, 'rare': 1.0, 'common': 0.1}
 
-        # APEX 极其感人的概率掉落算法
         for _ in range(count):
-            if random.random() < 0.002: # 传家宝 0.2% 概率
+            if random.random() < 0.002:
                 results['heirloom'] += 1
                 total_earned += values['heirloom']
 
@@ -1010,7 +1009,6 @@ async def simulate_apex_packs(msg: Message, count_str: str = "100"):
                 else:                  
                     pack_items.append('common')
             
-            # 每个组合包保底包含一件稀有(蓝)物品
             if all(x == 'common' for x in pack_items):
                 pack_items[0] = 'rare'
 
@@ -1021,7 +1019,6 @@ async def simulate_apex_packs(msg: Message, count_str: str = "100"):
         profit = total_earned - total_cost
         user_id, user_name = str(msg.author.id), msg.author.username
         
-        # 将盈利状况跨服同步到统一钱包
         if ECO_COLLECTION is not None:
             updated_doc = await ECO_COLLECTION.find_one_and_update(
                 {"_id": user_id}, 
@@ -1041,10 +1038,14 @@ async def simulate_apex_packs(msg: Message, count_str: str = "100"):
         else:
             total_profit = profit
 
-        if results['heirloom'] > 0: card_color = "#FF0000"  
-        elif results['legendary'] > 0: card_color = "#FFD700" 
-        elif results['epic'] > 0: card_color = "#800080" 
-        else: card_color = "#0000FF" 
+        if results['heirloom'] > 0:
+            card_color = "#FF0000"  
+        elif results['legendary'] > 0:
+            card_color = "#FFD700" 
+        elif results['epic'] > 0:
+            card_color = "#800080" 
+        else:
+            card_color = "#0000FF" 
 
         card = Card(color=card_color)
         card.append(Module.Header(f"APEX 英雄 {count} 包模拟结果"))
@@ -1066,12 +1067,17 @@ async def simulate_apex_packs(msg: Message, count_str: str = "100"):
         card.append(Module.Section(Element.Text("\n".join(lines), type=Types.Text.KMD)))
         
         context_text = f"[ 用户: {user_name} ] "
-        if results['heirloom'] > 0: context_text += "🎉 出传了！重生是你爹？"
-        elif results['legendary'] >= count * 0.1: context_text += "✨ 运气不错，金光闪闪！"
-        elif profit < -total_cost * 0.5: context_text += "😭 蓝天白云，至少说明模拟很贴合现实"
-        else: context_text += "👍 中规中矩，EA 感谢你的赞助"
+        if results['heirloom'] > 0:
+            context_text += "🎉 出传了！重生是你爹？"
+        elif results['legendary'] >= count * 0.1:
+            context_text += "✨ 运气不错，金光闪闪！"
+        elif profit < -total_cost * 0.5:
+            context_text += "😭 蓝天白云，至少说明模拟很贴合现实"
+        else:
+            context_text += "👍 中规中矩，EA 感谢你的赞助"
             
         card.append(Module.Context(Element.Text(context_text, type=Types.Text.KMD)))
+        
         await msg.reply(CardMessage(card))
         
     except Exception as e:
@@ -1080,7 +1086,6 @@ async def simulate_apex_packs(msg: Message, count_str: str = "100"):
 
 @bot.command(name='apexmap', prefixes=['/'])
 async def query_apex_map(msg: Message):
-    """APEX 地图轮换时间表追踪 API"""
     if not APEX_API_KEY or APEX_API_KEY == '你的APEX_KEY':
         return await msg.reply("⚠️ 机器人未配置 APEX_API_KEY，无法请求数据。")
 
@@ -1091,7 +1096,7 @@ async def query_apex_map(msg: Message):
             if resp.status == 404:
                 await safe_delete_msg(bot, loading_msg)
                 return await msg.reply(f"❌ 无法连接到APEX服务器，可能是土豆熟了")
-            elif resp.status == 429: # 针对第三方频控的专业拦截处理
+            elif resp.status == 429:
                 await safe_delete_msg(bot, loading_msg)
                 return await msg.reply("⏳ 接口请求过于频繁！Apex 官方 API 限制了查询速率，请等待 5~10 秒后再试。")
             elif resp.status != 200:
@@ -1146,7 +1151,6 @@ async def query_apex_map(msg: Message):
 
 @bot.command(name='apexstat', prefixes=['/'])
 async def query_apex_stat(msg: Message, player_name: str = "", platform: str = "PC"):
-    """全平台 APEX 战绩档案及在线状态监测 API"""
     if not APEX_API_KEY or APEX_API_KEY == '你的APEX_KEY':
         return await msg.reply("⚠️ 机器人未配置 APEX_API_KEY。")
         
@@ -1155,7 +1159,6 @@ async def query_apex_stat(msg: Message, player_name: str = "", platform: str = "
 
     loading_msg = await msg.reply(f"正在检索玩家 {player_name} 的档案...")
     try:
-        # 支持以 UID 或 昵称 两种维度去拉取数据
         if player_name.isdigit() and len(player_name) > 8:
             url = f"https://api.mozambiquehe.re/bridge?auth={APEX_API_KEY}&uid={player_name}&platform={platform.upper()}"
         else:
@@ -1166,7 +1169,7 @@ async def query_apex_stat(msg: Message, player_name: str = "", platform: str = "
             if resp.status == 404:
                 await safe_delete_msg(bot, loading_msg)
                 return await msg.reply(f"❌ 未找到玩家 `{player_name}`。\n💡 提示：请使用 **EA ID** 查询，不要使用 Steam 昵称（Steam同名太多查不到）。或者尝试更换平台参数（PC/PS4/X1）。")
-            elif resp.status == 429: 
+            elif resp.status == 429: # 👈 新增 429 拦截
                 await safe_delete_msg(bot, loading_msg)
                 return await msg.reply("⏳ 接口请求过于频繁！Apex 官方 API 限制了查询速率，请等待 5~10 秒后再试。")
             elif resp.status != 200:
@@ -1230,28 +1233,26 @@ async def query_apex_stat(msg: Message, player_name: str = "", platform: str = "
         await msg.reply("[Error] 解析战绩数据时发生异常。")
         
 # ==========================================
-# 5. 守护进程及应用启动入口
+# 5. 启动入口
 # ==========================================
 async def main():
     global AIO_SESSION
     AIO_SESSION = aiohttp.ClientSession(headers=STD_HEADERS)
     
-    # 🌟 1. 建立 MongoDB 永久连接
     await init_db()
 
-    # 🌟 2. 并发挂载基础数据后台刷新任务
     asyncio.create_task(init_crates_data())
     asyncio.create_task(init_translation_dictionary())
     asyncio.create_task(price_auto_updater())
 
-    # 🌟 3. 初始化占位用 Web 服务器 (规避 Serverless 平台无网络流量即休眠的问题)
     app = web.Application()
-    app.router.add_get('/', lambda r: web.Response(text="Bot Alive - Serverless Keepalive Probe Ready."))
+    app.router.add_get('/', lambda r: web.Response(text="Bot Alive"))
+    app.router.add_post('/webhook/afdian', afdian_webhook)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 7860).start()
 
-    logger.info("[System] 所有核心链路组件与 Web 探针已就绪，KHL 通讯信道准备开启...")
+    logger.info("[System] 所有组件就绪，Bot 启动！")
     try:
         await bot.start()
     finally:
